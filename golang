@@ -1,0 +1,412 @@
+同步原语的适用场景：
+共享资源：并发地读写共享资源，会出现数据竞争（data race）的问题，所以需要Mutex、RWMutex 这样的并发原语来保护。
+任务编排：需要 goroutine 按照一定的规律执行，而 goroutine 之间有相互等待或者依赖的顺序关系，我们常常使用 WaitGroup 或者 Channel 来实现。
+消息传递：信息交流以及不同的 goroutine 之间的线程安全的数据交流，常常使用Channel 来实现。
+
+Mutex
+例子: 我们创建了 10 个 goroutine，同时不断地对一个变量（count）进行加 1操作，每个 goroutine 负责执行 10 万次的加 1 操作，我们期望的最后计数的结果是 10 *100000 = 1000000 (一百万)。
+使用 sync.WaitGroup 来等待所有的 goroutine 执行完毕后，再输出最终的结果。count++不是一个原子操作，会出现并发访问问题；
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var count = 0
+	// 使用 WaitGroup 等待 10 个 goroutine 完成
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			// 对变量 count 执行 10 次加 1
+			for j := 0; j < 100000; j++ {
+				count++
+			}
+		}()
+	}
+	//等待10 个goroutine 完成
+	wg.Wait()
+	fmt.Println(count)
+}
+简单 使用 Mutex 解决并发访问问题
+func main() {
+	// 互斥锁保护计数器
+	var mu sync.Mutex
+	var count = 0
+	// 使用 WaitGroup 等待 10 个 goroutine 完成
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			// 对变量 count 执行 10 次加 1
+			for j := 0; j < 100000; j++ {
+				mu.Lock()
+				count++
+				mu.Unlock()
+			}
+		}()
+	}
+	//等待10 个goroutine 完成
+	wg.Wait()
+	fmt.Println(count)
+}
+Mutex 嵌入到 struct 中使用
+type Counter struct {
+	mu    sync.Mutex //如果嵌入的 struct 有多个字段，我们一般会把 Mutex 放在要控制的字段上面，然后使用空格把字段分隔开来。
+	Count uint64
+}
+
+func main() {
+	// 互斥锁保护计数器
+	var counter Counter
+	// 使用 WaitGroup 等待 10 个 goroutine 完成
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			// 对变量 count 执行 10 次加 1
+			for j := 0; j < 100000; j++ {
+				counter.mu.Lock()
+				counter.Count++
+				counter.mu.Unlock()
+			}
+		}()
+	}
+	//等待10 个goroutine 完成
+	wg.Wait()
+	fmt.Println(counter.Count)
+}
+Mutex 单独封装方法
+type Counter struct {
+	mu    sync.Mutex
+	Count uint64
+}
+
+func main() {
+	// 互斥锁保护计数器
+	var counter Counter
+	// 使用 WaitGroup 等待 10 个 goroutine 完成
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			defer wg.Done()
+			// 对变量 count 执行 10 次加 1
+			for j := 0; j < 100000; j++ {
+				counter.Incr()
+			}
+		}()
+	}
+	//等待10 个goroutine 完成
+	wg.Wait()
+	fmt.Println(counter.Count)
+}
+
+// Incr 加 1 的方法， 内部使用互斥锁保护
+func (c *Counter) Incr() {
+	c.mu.Lock()
+	c.Count++
+	c.mu.Unlock()
+}
+  注意： Mutex Unlock 方法可以被任意的 goroutine 调用释放锁，即使是没持有这个互斥锁的goroutine，也可以进行这个操作。这是因为，Mutex 本身并没有包含持有这把锁的goroutine 的信息，所以，Unlock 也不会对此进行检查。Mutex 的这个设计一直保持至今。 
+Mutex 设计：https://colobu.com/2018/12/18/dive-into-sync-mutex/
+
+正常模式和饥饿模式：Mutex 绝不容忍一个goroutine 被落下，永远没有机会获取锁。不抛弃不放弃是它的宗旨，而且它也尽可能地让等待较长的 goroutine 更有机会获取到锁。
+
+Mutex 4种易错场景: 
+1. Lock/Unlock不是成对出现
+c.Lock()
+defer c.Unlock()
+1. Copy已使用的Mutex
+type Counter struct {
+	sync.Mutex
+	Count int
+}
+
+func main() {
+	var c Counter
+	c.Lock()
+	defer c.Unlock()
+	c.Count++
+	foo(c) // 复制锁
+}
+
+// 这里 Counter 的参数是通过复制的方式传入的
+func foo(c Counter) {
+	c.Lock()
+	defer c.Unlock()
+	fmt.Println("in foo")
+}
+1. 重入 解决方案：锁记录 goroutine id 信息
+2. 死锁
+
+
+RWMutex ：基于Mutex实现 将串行的读变成并行读  可以解决读多写少的情况，比如 i++ 之类的运算
+Write-preferring：写优先的设计意味着，如果已经有一个 writer 在等待请求锁的话，它会阻止新来的请求锁的 reader 获取到锁，所以优先保障 writer。当然，如果有一些 reader 已经请求了锁的话，新请求的 writer 也会等待已经存在的 reader 都释放锁之后才能获取。
+
+Lock/Unlock：写操作时调用的方法。如果锁已经被 reader 或者 writer 持有，那么，Lock 方法会一直阻塞，直到能获取到锁；Unlock 则是配对的释放锁的方法。
+RLock/RUnlock：读操作时调用的方法。如果锁已经被 writer 持有的话，RLock 方法会一直阻塞，直到能获取到锁，否则就直接返回；而 RUnlock 是 reader 释放锁的方法。
+RLocker：这个方法的作用是为读操作返回一个 Locker 接口的对象。它的 Lock 方法会调用 RWMutex 的 RLock 方法，它的 Unlock 方法会调用 RWMutex 的 RUnlock 方法。
+
+WaitGroup 
+func (wg *WaitGroup) Add(delta int)
+func (wg *WaitGroup) Done()
+func (wg *WaitGroup) Wait()
+
+使用注意事项：
+不重用 WaitGroup。新建一个 WaitGroup 不会带来多大的资源开销，重用反而更容易出错。
+保证所有的 Add 方法调用都在 Wait 之前。
+不传递负数给 Add 方法，只通过 Done 来给计数值减 1。
+不做多余的 Done 方法调用，保证 Add 的计数值和 Done 方法调用的数量是一样的。
+不遗漏 Done 方法的调用，否则会导致 Wait hang 住无法返回。
+
+Cond （不常用）
+
+Once （单例模式）
+Once 可以用来执行且仅仅执行一次动作，常常用于单例对象的初始化场景。    
+sync.Once 只暴露了一个方法 Do，你可以多次调用 Do 方法，但是只有第一次调用 Do方法时 f 参数才会执行，这里的 f 是一个无参数无返回值的函数。
+func (o *Once) Do (f func())
+闭包常用使用方法
+var addr = "baidu.com"
+var conn net.Conn
+var err error
+once.Do(func(){
+    conn,err = net.Dial("tcp",addr)
+})
+
+map 
+sync.map 使用场景并不多
+1.只会增长的缓存系统中，一个 key 只写入一次而被读很多次；可以进行更新，但是不要删除，并且不要频繁地增加新元素。
+2.多个 goroutine 为不相交的键集读、写和重写键值对。
+
+Pool
+Go 是一个自动垃圾回收的编程语言，采用三色并发标记算法标记对象并回收。 如果你想使用 Go 开发一个高性能的应用程序的话，就必须考虑垃圾回收给性能带来的影响。毕竟 Go 的自动垃圾回收机制还是有一个 STW（stop-the-world，程序暂停）的时间，而且，大量地创建在堆上的对象，也会影响垃圾回收标记的时间。
+我们一般不会在程序一开始的时候就开始考虑优化，而是等项目开发到一个阶段，或者快结束的时候，才全面地考虑程序中的优化点，而 Pool 就是常用的一个优化手段。
+使用套路（tcp连接池）
+//工厂模式，提供创建连接的工厂方法
+factory := func()(net.Conn,error){return net.Dial("tcp","127.0.0.1:400")}
+//创建一个tcp池，提供初始容量和最大容量以及工厂方法
+p,err:=pool.NewChannelPool(5,30,factory)
+//获取一个连接
+conn,err:=p.Get()
+//Close并不会真正关闭这个连接，而是把它放回池子，所以你不必显式地Put这个对象到池子中
+conn.Close()
+//通过调用MarkUnusable,Close的时候就会真正关闭底层的tcp的连接了
+if pc,ok:=conn.(*pool.PoolConn);ok{
+    pc.MarkUnusable()
+    pc.Close()
+}
+//关闭池子就会关闭=池子中的所有的tcp连接
+p.Close()
+//当前池子中的连接的数量
+current:=p.Len()
+
+Context
+我们经常使用 Context 来取消一个 goroutine 的运行，这是 Context 最常用的场景之一，Context 也被称为 goroutine 生命周期范围（goroutine-scoped）的 Context，把Context 传递给 goroutine。但是，goroutine 需要尝试检查 Context 的 Done 是否关闭了
+使用套路
+func main(){
+    ctx,cancel:=context.WithCancel(context.Background())
+    go func(){
+        defer func(){
+            fmt.Println("goroutine exit")
+        }()
+        for {
+            select {
+            case<-ctx.Done():
+                return
+            default:
+                time.Sleep(time.Second)
+            }
+        }    
+    }()
+    
+    time.Sleep(time.Second)
+    cancel()
+    time.Sleep(2*time.Second)
+}
+
+atomic（提供原子操作 及不可再拆分的操作 是其他并发元语的底层比如 Mutex）
+atomic 操作的对象是一个地址，你需要把可寻址的变量的地址作为参数传递给方法，而不是把变量的值传递给方法。
+适用场景：假设你想在程序中使用一个标志（flag，比如一个 bool 类型的变量），来标识一个定时任务是否已经启动执行了。
+实现Lock-Free queue
+package queue
+import
+(
+"sync/atomic"
+"unsafe"
+)
+//lock-free的queue
+type LKQueue struct{
+    head unsafe.Pointer
+    tail unsafe.Pointer
+}
+//通过链表实现，这个数据结构代表链表中的节点
+type node struct{
+    value interface{}
+    next unsafe.Pointer
+}
+
+func NewLKQueue()*LKQueue{
+    n := unsafe.Pointer(&node{})
+    return &LKQueue{
+        head:n,
+        tail:n
+    }
+}
+//入队
+func(q *LKQueue)Enqueue(v interface{}){
+    n:=&node{value:v}
+    for {
+        tail:=load(&q.tail)
+        next:=load(&tail.next)
+        if tail == load(&q.tail){
+            //尾还是尾
+            if next == nil{
+                //还没有新数据入队
+                if cas(&tail.next,next,n){
+                //增加到队尾
+                cas(&q.tail,tail,n)
+                //入队成功，移动尾巴指针
+                return
+            }
+        }else{
+            //已有新数据加到队列后面，需要移动尾指针
+            cas(&q.tail,tail,next)
+            }
+        }
+    }    
+}
+
+//出队，没有元素则返回nil
+func(q *LKQueue)Dequeue()interface{}{
+    for{
+        head:=load(&q.head)
+        tail:=load(&q.tail)
+        next:=load(&head.next)
+        if head == load(&q.head){
+        //head还是那个head
+            if head == tail{
+            //head和tail一样
+            if next == nil{
+                //说明是空队列
+                return nil
+            }
+            //只是尾指针还没有调整，尝试调整它指向下一个
+            cas(&q.tail,tail,next)}
+        else{
+            //读取出队的数据
+            v:=next.value
+            //既然要出队了，头指针移动到下一个
+            if cas(&q.head,head,next){
+            return v
+            //Dequeue isdone.
+            return
+            }
+        }
+        }
+}
+}
+//将unsafe.Pointer原子加载转换成node
+func load(p *unsafe.Pointer)(n *node){
+    return
+(*node)(atomic.LoadPointer(p))}
+//封装CAS,避免直接将*node转换成unsafe.Pointer
+func cas(p *unsafe.Pointer,old,new*node)(okbool){
+    return atomic.CompareAndSwapPointer(p,
+unsafe.Pointer(old)
+,
+unsafe.Pointer(new))
+}
+
+Channel
+执行业务处理的 goroutine 不要通过共享内存的方式通信（通过锁），而是要通过 Channel 通信的方式分享数据（通过CSP）。
+
+内存模型（重排及可见性）
+
+分布式并发原语（go etcd）
+使用互斥锁的不同节点是没有主从这样的角色的，所有的节点都是一样的，只不过在同一时刻，只允许其中的一个节点持有锁
+主节点常常执行写操作，从节点常常执行读操作，如果读写都在主节点，从节点只是提供一个备份功能的话，那么，主从架构就会退化成主备模式架构。
+
+
+runtime 可以处理的阻塞
+
+
+并发挂载在sudog 非并发挂载在g
+
+runtime没法拦截的阻塞
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+goroutine 没有优先级
+
+
+
+
+
+
+
+内存和cpu权衡
+
+timer会更矮一点 空间局部性 好一点
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+栈上分配
+
+堆上分配
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+堆上的变量都是共享的 使用需要加锁
+
+
+
+
+
+
+
+
+
+
+强三色标记：黑色对象不可以指向白色对象
+弱三色标记：黑色对象可以指向白色对象（该白色对象必须有灰色对象指向）
